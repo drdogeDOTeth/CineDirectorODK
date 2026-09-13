@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "CineDirector (Otherside ODK)",
+	"Description": "The Otherside ODK edition of CineDirector. Describe a shot in plain language and it sets up cine cameras, keyframes, focus and camera cuts in the open Level Sequence, keys the lighting, drives the face from dialogue audio, and renders through Movie Render Queue. Pure Python, for the ODK's Blueprint-only Unreal 5.5 build where no C++ module can be compiled.",
+	"Category": "Cinematics",
+	"CreatedBy": "Roundtree",
+	"CreatedByURL": "",
+	"DocsURL": "https://github.com/drdogeDOTeth/CineDirectorODK",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/drdogeDOTeth/CineDirectorODK/issues",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Plugins": [
+		{ "Name": "PythonScriptPlugin", "Enabled": true },
+		{ "Name": "SequencerScripting", "Enabled": true },
+		{ "Name": "LevelSequenceEditor", "Enabled": true },
+		{ "Name": "MovieRenderPipeline", "Enabled": true },
+		{ "Name": "EditorScriptingUtilities", "Enabled": true }
+	]
+}

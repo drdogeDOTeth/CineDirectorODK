@@ -1,0 +1,15 @@
+# Python bytecode, per-interpreter and never worth committing
+__pycache__/
+*.py[cod]
+
+# Unreal build artifacts. This plugin compiles nothing, but the editor still
+# writes these if it is ever opened from inside the checkout.
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# IDE
+.vs/
+.vscode/
+.idea/
