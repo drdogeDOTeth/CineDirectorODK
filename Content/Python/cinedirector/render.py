@@ -11,6 +11,7 @@ import glob
 import os
 import shutil
 import subprocess
+import threading
 
 import unreal
 
@@ -30,7 +31,7 @@ QUALITY_LOW, QUALITY_MED, QUALITY_HIGH, QUALITY_EPIC = 0, 1, 2, 3
 # and faststart puts the index up front so it streams. -shortest keeps audio and
 # video aligned when the wav and the frame sequence differ by a few samples.
 _FFMPEG_COMPAT = (" -pix_fmt yuv420p -profile:v high -level 4.2"
-                  " -movflags +faststart -b:a 192k -shortest")
+                  " -threads 2 -movflags +faststart -b:a 192k -shortest")
 
 _ENCODE_SETTINGS = {
     "encode_settings_low": "-crf 28" + _FFMPEG_COMPAT,
@@ -50,7 +51,7 @@ class RenderOptions(object):
     def __init__(self):
         self.width = 1920
         self.height = 1080
-        self.format = PNG
+        self.format = MP4
         self.encode_quality = QUALITY_HIGH
         # Anti-aliasing accumulation. 1/1 is draft, engine AA only. Higher
         # temporal counts add true sub-frame motion blur, and cost render time.
@@ -58,6 +59,9 @@ class RenderOptions(object):
         self.spatial_samples = 1
         # Empty uses Movie Render Queue's default, {project}/Saved/MovieRenders.
         self.output_directory = ""
+        # Optional short range for scripted renders; the panel uses full range.
+        self.start_frame = None
+        self.end_frame = None
 
 
 class RenderError(Exception):
@@ -231,10 +235,12 @@ def _add_mp4_settings(config, quality, notes):
     except Exception:
         pass
     try:
-        # Drop the PNGs and the wav after a successful mux so only the MP4 remains.
+        # Unreal removes source frames only after the CLI encoder succeeds.
         encoder.set_editor_property("delete_source_files", True)
-    except Exception:
-        pass
+        if not encoder.get_editor_property("delete_source_files"):
+            raise RuntimeError("setting was not retained")
+    except Exception as error:
+        raise RenderError("MP4 cleanup could not be enabled: %s" % error)
 
     notes.append("MP4 via ffmpeg at %s (yuv420p High, Sequencer audio to AAC)."
                  % ffmpeg_path)
@@ -268,6 +274,68 @@ def _close_sequencer():
                            "render (%s). Close it by hand if the editor crashes "
                            "when the render finishes." % error)
         return False
+
+
+_ACTIVE_AUDIO_RESTORES = []
+
+
+def _flatten_render_audio(sequence):
+    """Make spatialized sequence audio audible to this ODK build's MRQ WAV pass.
+
+    MRQ records silence for sounds with attenuation settings in ODK 5.5. The
+    changes live only in editor memory and are restored when the executor ends.
+    """
+    original = []
+    visited_sequences = set()
+    visited_sounds = set()
+    try:
+        dirty_before = {p.get_name() for p in
+                        unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+    except Exception:
+        dirty_before = set()
+
+    def visit(current):
+        path = current.get_path_name()
+        if path in visited_sequences:
+            return
+        visited_sequences.add(path)
+        tracks = list(current.get_tracks())
+        for binding in current.get_bindings():
+            tracks.extend(binding.get_tracks())
+        for track in tracks:
+            for section in track.get_sections():
+                if isinstance(track, unreal.MovieSceneAudioTrack):
+                    try:
+                        sound = section.get_editor_property("sound")
+                        if sound is None or sound.get_path_name() in visited_sounds:
+                            continue
+                        visited_sounds.add(sound.get_path_name())
+                        attenuation = sound.get_editor_property("attenuation_settings")
+                        if attenuation is not None:
+                            was_dirty = sound.get_outermost().get_name() in dirty_before
+                            original.append((sound, attenuation, was_dirty))
+                            sound.set_editor_property("attenuation_settings", None)
+                    except Exception as error:
+                        unreal.log_warning("CineDirector: audio override failed: %s" % error)
+                elif isinstance(track, unreal.MovieSceneSubTrack):
+                    child = section.get_sequence()
+                    if child is not None:
+                        visit(child)
+
+    visit(sequence)
+    return original
+
+
+def _restore_render_audio(original):
+    asset_subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+    for sound, attenuation, was_dirty in original:
+        try:
+            sound.set_editor_property("attenuation_settings", attenuation)
+            if not was_dirty:
+                asset_subsystem.set_dirty_flag(sound, False)
+        except Exception as error:
+            unreal.log_error("CineDirector: could not restore %s audio: %s"
+                             % (sound.get_name(), error))
 
 
 def build_job(options, sequence=None, dry_run=False):
@@ -348,6 +416,10 @@ def build_job(options, sequence=None, dry_run=False):
     output.set_editor_property(
         "output_resolution",
         unreal.IntPoint(max(int(options.width), 2), max(int(options.height), 2)))
+    if options.start_frame is not None and options.end_frame is not None:
+        output.set_editor_property("use_custom_playback_range", True)
+        output.set_editor_property("custom_start_frame", int(options.start_frame))
+        output.set_editor_property("custom_end_frame", int(options.end_frame))
 
     if options.output_directory:
         try:
@@ -381,10 +453,25 @@ def build_job(options, sequence=None, dry_run=False):
     if _close_sequencer():
         notes.append("Closed Sequencer for the render.")
 
-    executor = subsystem.render_queue_with_executor(unreal.MoviePipelinePIEExecutor)
+    audio_restore = _flatten_render_audio(sequence) if fmt == MP4 else []
+    try:
+        executor = subsystem.render_queue_with_executor(unreal.MoviePipelinePIEExecutor)
+    except Exception:
+        _restore_render_audio(audio_restore)
+        raise
     if executor is None:
+        _restore_render_audio(audio_restore)
         raise RenderError("Movie Render Queue refused to start the render. Check "
                           "the Output Log.")
+    if audio_restore:
+        def restore_audio(_executor, _success):
+            _restore_render_audio(audio_restore)
+            _ACTIVE_AUDIO_RESTORES.remove(restore_audio)
+
+        _ACTIVE_AUDIO_RESTORES.append(restore_audio)
+        executor.on_executor_finished_delegate.add_callable(restore_audio)
+        notes.append("MRQ audio workaround: spatial sound is mixed in 2D for "
+                     "the MP4; original sound settings are restored afterward.")
     notes.append("Render started.")
     return job, notes
 
@@ -520,7 +607,7 @@ def _sequence_audio_fallback(first_frame):
 
 
 def encode_folder(directory, fps=30.0, quality=QUALITY_HIGH, output_path="",
-                  audio_path=""):
+                  audio_path="", on_complete=None, delete_frames=False):
     """
     Turn a folder of rendered frames into an MP4.
 
@@ -552,6 +639,10 @@ def encode_folder(directory, fps=30.0, quality=QUALITY_HIGH, output_path="",
     if not number.isdigit():
         raise RenderError("Frame names in %s are not <name>.<number>.<ext>, so "
                           "they cannot be encoded as a sequence." % directory)
+    frames = [name for name in frames
+              if name.startswith(base + ".")
+              and name.endswith("." + tail)
+              and name[len(base) + 1:-len(tail) - 1].isdigit()]
     pattern = os.path.join(directory, "%s.%%0%dd.%s" % (base, len(number), tail))
     start = int(number)
 
@@ -595,26 +686,51 @@ def encode_folder(directory, fps=30.0, quality=QUALITY_HIGH, output_path="",
 
     command += [
         "-c:v", "libx264", "-crf", str(crf),
+        "-threads", "2",
         "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.2",
         "-movflags", "+faststart",
         output_path,
     ]
 
     notes.append("Encoding %d frames at %g fps, crf %d." % (len(frames), fps, crf))
-    try:
-        finished = subprocess.run(command, capture_output=True, text=True,
-                                  timeout=3600)
-    except Exception as error:              # noqa: BLE001
-        raise RenderError("ffmpeg could not be run: %s" % error)
+    def run_encode():
+        try:
+            finished = subprocess.run(command, capture_output=True, text=True,
+                                      timeout=3600)
+            if finished.returncode != 0:
+                raise RenderError("ffmpeg failed: %s"
+                                  % (finished.stderr or "").strip()[:400])
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                raise RenderError("ffmpeg finished without a playable output file.")
+            size_mb = os.path.getsize(output_path) / (1024.0 * 1024.0)
+            notes.append("Wrote %s (%.1f MB, %.1f seconds)."
+                         % (output_path, size_mb,
+                            len(frames) / max(float(fps), 1.0)))
+            if delete_frames:
+                for name in frames:
+                    os.remove(os.path.join(directory, name))
+                if wav and os.path.dirname(os.path.abspath(wav)) == os.path.abspath(directory):
+                    os.remove(wav)
+                notes.append("Removed source frames and render audio.")
+            return output_path, notes, None
+        except Exception as error:          # noqa: BLE001
+            return output_path, notes, error
 
-    if finished.returncode != 0:
-        raise RenderError("ffmpeg failed: %s"
-                          % (finished.stderr or "").strip()[:400])
+    if on_complete is not None:
+        # The panel polls this state on the editor thread. ffmpeg can take many
+        # minutes; waiting for it in a Slate button callback freezes Unreal.
+        state = {"done": False, "result": None}
+        def worker():
+            state["result"] = run_encode()
+            state["done"] = True
+        threading.Thread(target=worker, name="CineDirector-ffmpeg", daemon=True).start()
+        on_complete(state)
+        return output_path, notes
 
-    size_mb = os.path.getsize(output_path) / (1024.0 * 1024.0)
-    notes.append("Wrote %s (%.1f MB, %.1f seconds)."
-                 % (output_path, size_mb, len(frames) / max(float(fps), 1.0)))
-    return output_path, notes
+    path, notes, error = run_encode()
+    if error:
+        raise error
+    return path, notes
 
 
 def start_render(options, sequence=None):

@@ -38,6 +38,7 @@ ROOT_CANDIDATES = ("Root", "RootBox", "RootScroll", "CanvasPanel_0", "ScrollBox_
 # Anything Python builds at runtime has to stay referenced from here, or the
 # callbacks are collected and the buttons go dead a few seconds after opening.
 _LIVE = {"widget": None, "root": None, "handlers": [], "fields": {}}
+_ENCODE = {"state": None, "tick": None}
 
 
 EXAMPLES = (
@@ -504,14 +505,27 @@ def _on_frames_to_mp4():
     """Encode the last render's frame folder, or whatever the field points at."""
     try:
         from . import render as cd_render
+        if _ENCODE["state"] is not None:
+            _status("An MP4 encode is already running.")
+            return
         folder = _field_text("frames") or cd_render.last_output_directory()
         if not folder:
             _status("Type the folder your frames are in, then press this again.",
                     True)
             return
+        def started(state):
+            _ENCODE["state"] = state
+            def poll(_delta_time):
+                if not state["done"]:
+                    return
+                unreal.unregister_slate_post_tick_callback(_ENCODE["tick"])
+                _ENCODE["tick"] = None
+                _ENCODE["state"] = None
+                _path, notes, error = state["result"]
+                _status(str(error) if error else "\n".join(notes), bool(error))
+            _ENCODE["tick"] = unreal.register_slate_post_tick_callback(poll)
         _status("Encoding %s..." % folder)
-        path, notes = cd_render.encode_folder(folder)
-        _status("\n".join(notes))
+        cd_render.encode_folder(folder, on_complete=started, delete_frames=True)
     except Exception as error:                          # noqa: BLE001
         _status(str(error), True)
 

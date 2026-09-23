@@ -396,7 +396,7 @@ def open_render_dialog():
         request.set_editor_property("resolution_height",
                                    _LAST_RENDER.get("resolution_height", 1080))
         request.set_editor_property("output_format",
-                                   _LAST_RENDER.get("output_format", cd_render.PNG))
+                                   _LAST_RENDER.get("output_format", cd_render.MP4))
         request.set_editor_property("encode_quality",
                                    _LAST_RENDER.get("encode_quality", cd_render.QUALITY_HIGH))
         request.set_editor_property("temporal_samples",

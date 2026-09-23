@@ -47,6 +47,12 @@ Nothing else is required, but MP4 output needs ffmpeg on the machine:
 winget install Gyan.FFmpeg
 ```
 
+The render dialog defaults to MP4 with AAC audio. Movie Render Queue uses
+temporary PNG frames and a WAV while encoding, then removes them after a
+successful MP4 export. The ODK engine's WAV export renders spatially attenuated
+Sequencer sounds as silence. CineDirector temporarily mixes those sounds in 2D
+for MP4 renders and restores their original attenuation settings afterward.
+
 ## One-time panel setup
 
 The dockable panel is an Editor Utility Widget that Python fills at runtime. This
