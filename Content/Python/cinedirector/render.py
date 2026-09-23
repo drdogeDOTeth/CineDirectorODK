@@ -11,7 +11,9 @@ import glob
 import os
 import shutil
 import subprocess
+import sys
 import threading
+import uuid
 
 import unreal
 
@@ -223,26 +225,12 @@ def _add_mp4_settings(config, quality, notes):
     # ever sees images and every MP4 comes out silent.
     config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
     if not _add_wave_output(config, notes):
-        notes.append("The MP4 will be silent.")
+        raise RenderError("MP4 with audio requires MoviePipelineWaveOutput.")
 
-    encoder = config.find_or_add_setting_by_class(unreal.MoviePipelineCommandLineEncoder)
-    try:
-        levels = (unreal.MoviePipelineEncodeQuality.LOW,
-                  unreal.MoviePipelineEncodeQuality.MED,
-                  unreal.MoviePipelineEncodeQuality.HIGH,
-                  unreal.MoviePipelineEncodeQuality.EPIC)
-        encoder.set_editor_property("quality", levels[max(0, min(quality, 3))])
-    except Exception:
-        pass
-    try:
-        # Unreal removes source frames only after the CLI encoder succeeds.
-        encoder.set_editor_property("delete_source_files", True)
-        if not encoder.get_editor_property("delete_source_files"):
-            raise RuntimeError("setting was not retained")
-    except Exception as error:
-        raise RenderError("MP4 cleanup could not be enabled: %s" % error)
-
-    notes.append("MP4 via ffmpeg at %s (yuv420p High, Sequencer audio to AAC)."
+    # Unreal's CLI encoder waits inside finalization while ffmpeg encodes. On
+    # long jobs this can stall the editor and prevent its source cleanup callback.
+    # The standalone worker starts only after MRQ finishes its PNG/WAV passes.
+    notes.append("MP4 via external ffmpeg at %s (Sequencer audio to AAC)."
                  % ffmpeg_path)
 
 
@@ -277,6 +265,37 @@ def _close_sequencer():
 
 
 _ACTIVE_AUDIO_RESTORES = []
+
+
+_ACTIVE_ENCODE_SIGNALS = []
+
+
+def _launch_external_encode(directory, sequence_name, ffmpeg_path, fps, quality):
+    """Run video encoding outside Unreal; return a completion marker path."""
+    if not directory:
+        directory = os.path.join(unreal.Paths.project_saved_dir(), "MovieRenders")
+    directory = os.path.abspath(directory)
+    os.makedirs(directory, exist_ok=True)
+    marker = os.path.join(directory, ".cinedirector-" + uuid.uuid4().hex + ".ready")
+    bundled_python = os.path.join(unreal.Paths.engine_dir(), "Binaries",
+                                  "ThirdParty", "Python3", "Win64", "python.exe")
+    python = (bundled_python if os.path.isfile(bundled_python) else
+              sys.executable if os.path.basename(sys.executable).lower() in
+              ("python.exe", "pythonw.exe") else
+              shutil.which("pythonw") or shutil.which("python"))
+    ffprobe = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe.exe")
+    if not python or not os.path.isfile(python) or not os.path.isfile(ffprobe):
+        unreal.log_warning("CineDirector: external MP4 encoder unavailable "
+                           "(Python or ffprobe missing).")
+        return None
+    helper = os.path.join(os.path.dirname(__file__), "render_cleanup.py")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen([python, helper, directory, sequence_name, ffprobe,
+                      str(os.getpid()), marker, ffmpeg_path, str(fps),
+                      str(quality)],
+                     creationflags=flags, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+    return marker
 
 
 def _flatten_render_audio(sequence):
@@ -463,6 +482,26 @@ def build_job(options, sequence=None, dry_run=False):
         _restore_render_audio(audio_restore)
         raise RenderError("Movie Render Queue refused to start the render. Check "
                           "the Output Log.")
+    if fmt == MP4:
+        try:
+            rate = sequence.get_display_rate()
+            fps = float(rate.numerator) / float(rate.denominator)
+            marker = _launch_external_encode(options.output_directory,
+                                             sequence.get_name(), find_ffmpeg(),
+                                             fps, options.encode_quality)
+            if marker is None:
+                raise RenderError("External MP4 encoder could not start.")
+            def signal_encode(_executor, success):
+                if success:
+                    with open(marker, "w", encoding="ascii") as signal:
+                        signal.write("ready\n")
+                _ACTIVE_ENCODE_SIGNALS.remove(signal_encode)
+            _ACTIVE_ENCODE_SIGNALS.append(signal_encode)
+            executor.on_executor_finished_delegate.add_callable(signal_encode)
+        except Exception as error:
+            unreal.log_error("CineDirector: external MP4 encode setup failed: %s"
+                             % error)
+            raise
     if audio_restore:
         def restore_audio(_executor, _success):
             _restore_render_audio(audio_restore)

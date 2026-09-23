@@ -47,9 +47,12 @@ Nothing else is required, but MP4 output needs ffmpeg on the machine:
 winget install Gyan.FFmpeg
 ```
 
-The render dialog defaults to MP4 with AAC audio. Movie Render Queue uses
-temporary PNG frames and a WAV while encoding, then removes them after a
-successful MP4 export. The ODK engine's WAV export renders spatially attenuated
+The render dialog defaults to MP4 with AAC audio. Movie Render Queue writes
+temporary PNG frames and a WAV, then a separate ffmpeg process encodes the MP4
+after Unreal finishes rendering. The worker checks the decoded frame count and
+audio track before replacing the MP4 and removing the temporary files. If the
+render or encode fails, it keeps the sources for recovery. The ODK engine's WAV
+export renders spatially attenuated
 Sequencer sounds as silence. CineDirector temporarily mixes those sounds in 2D
 for MP4 renders and restores their original attenuation settings afterward.
 
