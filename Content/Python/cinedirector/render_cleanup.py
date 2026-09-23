@@ -1,21 +1,12 @@
 """Encode MRQ frames outside Unreal, then verify and remove the sources."""
 
 import argparse
-import ctypes
 import glob
 import json
 import os
 import subprocess
 import time
 import wave
-
-
-def process_alive(pid):
-    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return False
-    ctypes.windll.kernel32.CloseHandle(handle)
-    return True
 
 
 def frame_paths(directory, stem):
@@ -42,36 +33,39 @@ def valid_video(path, frames, ffprobe):
         return False
 
 
-def encode_when_ready(directory, stem, ffmpeg, ffprobe, parent_pid,
-                      marker, fps, quality, timeout=86400):
-    """Encode outside Unreal after MRQ signals that its PNG and WAV passes ended."""
+def encode_when_ready(directory, stem, ffmpeg, ffprobe, expected_frames,
+                      fps, quality, timeout=86400):
+    """Encode after the complete frame set and matching WAV settle on disk."""
     deadline = time.monotonic() + timeout
-    while not os.path.isfile(marker):
-        if not process_alive(parent_pid):
-            # The editor may have exited just before its completion delegate.
-            # Wait for disk writes to settle, then require the WAV duration to
-            # account for every frame before attempting recovery.
-            time.sleep(30)
-            frames = frame_paths(directory, stem)
-            wav = os.path.join(directory, stem + ".wav")
-            try:
-                with wave.open(wav, "rb") as audio:
-                    expected = round(audio.getnframes() / audio.getframerate() * fps)
-                if abs(len(frames) - expected) > 1:
-                    return False
-            except (OSError, ValueError, wave.Error):
-                return False
-            break
-        if time.monotonic() >= deadline:
-            return False
+    wav = os.path.join(directory, stem + ".wav")
+    stable_since = None
+    previous_size = -1
+    while time.monotonic() < deadline:
+        try:
+            size = os.path.getsize(wav)
+            with wave.open(wav, "rb") as audio:
+                audio_frames = round(audio.getnframes() /
+                                     audio.getframerate() * fps)
+        except (OSError, ValueError, wave.Error, ZeroDivisionError):
+            size = 0
+            audio_frames = -1
+        audio_ready = abs(audio_frames - expected_frames) <= 1 and size > 0
+        frames = frame_paths(directory, stem) if audio_ready else []
+        ready = len(frames) == expected_frames and audio_ready
+        if ready and size == previous_size:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= 10:
+                break
+        else:
+            stable_since = None
+        previous_size = size
         time.sleep(2)
-    frames = frame_paths(directory, stem)
-    if not frames:
+    else:
         return False
     numbers = [number for number, _ in frames]
     if numbers != list(range(numbers[0], numbers[0] + len(numbers))):
         return False
-    wav = os.path.join(directory, stem + ".wav")
     if not os.path.isfile(wav) or os.path.getsize(wav) == 0:
         return False
     # MRQ uses a fixed-width frame number; confirm it before asking ffmpeg to
@@ -103,11 +97,6 @@ def encode_when_ready(directory, stem, ffmpeg, ffprobe, parent_pid,
         return True
     except (OSError, subprocess.SubprocessError):
         return False
-    finally:
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":
@@ -115,11 +104,10 @@ if __name__ == "__main__":
     parser.add_argument("directory")
     parser.add_argument("stem")
     parser.add_argument("ffprobe")
-    parser.add_argument("parent_pid", type=int)
-    parser.add_argument("marker")
+    parser.add_argument("expected_frames", type=int)
     parser.add_argument("ffmpeg")
     parser.add_argument("fps", type=float)
     parser.add_argument("quality", type=int)
     args = parser.parse_args()
     encode_when_ready(args.directory, args.stem, args.ffmpeg, args.ffprobe,
-                      args.parent_pid, args.marker, args.fps, args.quality)
+                      args.expected_frames, args.fps, args.quality)

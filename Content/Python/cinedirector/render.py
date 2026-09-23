@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import uuid
 
 import unreal
 
@@ -267,16 +266,16 @@ def _close_sequencer():
 _ACTIVE_AUDIO_RESTORES = []
 
 
-_ACTIVE_ENCODE_SIGNALS = []
+_ACTIVE_EXECUTORS = []
 
 
-def _launch_external_encode(directory, sequence_name, ffmpeg_path, fps, quality):
-    """Run video encoding outside Unreal; return a completion marker path."""
+def _launch_external_encode(directory, sequence_name, ffmpeg_path,
+                            expected_frames, fps, quality):
+    """Run video encoding outside Unreal after all render files settle."""
     if not directory:
         directory = os.path.join(unreal.Paths.project_saved_dir(), "MovieRenders")
     directory = os.path.abspath(directory)
     os.makedirs(directory, exist_ok=True)
-    marker = os.path.join(directory, ".cinedirector-" + uuid.uuid4().hex + ".ready")
     bundled_python = os.path.join(unreal.Paths.engine_dir(), "Binaries",
                                   "ThirdParty", "Python3", "Win64", "python.exe")
     python = (bundled_python if os.path.isfile(bundled_python) else
@@ -287,15 +286,15 @@ def _launch_external_encode(directory, sequence_name, ffmpeg_path, fps, quality)
     if not python or not os.path.isfile(python) or not os.path.isfile(ffprobe):
         unreal.log_warning("CineDirector: external MP4 encoder unavailable "
                            "(Python or ffprobe missing).")
-        return None
+        return False
     helper = os.path.join(os.path.dirname(__file__), "render_cleanup.py")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen([python, helper, directory, sequence_name, ffprobe,
-                      str(os.getpid()), marker, ffmpeg_path, str(fps),
+                      str(expected_frames), ffmpeg_path, str(fps),
                       str(quality)],
                      creationflags=flags, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
-    return marker
+    return True
 
 
 def _flatten_render_audio(sequence):
@@ -482,22 +481,26 @@ def build_job(options, sequence=None, dry_run=False):
         _restore_render_audio(audio_restore)
         raise RenderError("Movie Render Queue refused to start the render. Check "
                           "the Output Log.")
+    _ACTIVE_EXECUTORS.append(executor)
+    def release_executor(_executor, _success):
+        _ACTIVE_EXECUTORS.remove(executor)
+    executor.on_executor_finished_delegate.add_callable(release_executor)
     if fmt == MP4:
         try:
             rate = sequence.get_display_rate()
             fps = float(rate.numerator) / float(rate.denominator)
-            marker = _launch_external_encode(options.output_directory,
-                                             sequence.get_name(), find_ffmpeg(),
-                                             fps, options.encode_quality)
-            if marker is None:
+            expected_frames = (int(options.end_frame) - int(options.start_frame)
+                               if options.start_frame is not None and
+                               options.end_frame is not None else
+                               int(sequence.get_playback_end()) -
+                               int(sequence.get_playback_start()))
+            if expected_frames <= 0:
+                raise RenderError("Sequence has no frames to encode.")
+            if not _launch_external_encode(options.output_directory,
+                                           sequence.get_name(), find_ffmpeg(),
+                                           expected_frames, fps,
+                                           options.encode_quality):
                 raise RenderError("External MP4 encoder could not start.")
-            def signal_encode(_executor, success):
-                if success:
-                    with open(marker, "w", encoding="ascii") as signal:
-                        signal.write("ready\n")
-                _ACTIVE_ENCODE_SIGNALS.remove(signal_encode)
-            _ACTIVE_ENCODE_SIGNALS.append(signal_encode)
-            executor.on_executor_finished_delegate.add_callable(signal_encode)
         except Exception as error:
             unreal.log_error("CineDirector: external MP4 encode setup failed: %s"
                              % error)
