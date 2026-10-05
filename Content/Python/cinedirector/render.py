@@ -16,6 +16,8 @@ import threading
 
 import unreal
 
+from . import settings as cd_settings
+
 PNG = "png"
 JPEG = "jpeg"
 EXR = "exr"
@@ -409,6 +411,21 @@ def build_job(options, sequence=None, dry_run=False):
                           "Render Queue plugin and restart the editor.")
     if subsystem.is_rendering():
         raise RenderError("A render is already in progress.")
+
+    # No folder picked: the project's render folders from CineDirector's settings, if set. A folder for
+    # the sequence's content path first (longest prefix wins), else the root with a subfolder per sequence.
+    if not options.output_directory:
+        values = cd_settings.load()
+        sequence_path = sequence.get_path_name()
+        by_path = values.get("render_output_by_path") or {}
+        for prefix in sorted(by_path, key=len, reverse=True):
+            if by_path[prefix] and sequence_path.startswith(prefix):
+                options.output_directory = str(by_path[prefix])
+                break
+        else:
+            root = str(values.get("render_output_directory") or "").strip()
+            if root:
+                options.output_directory = os.path.join(root, sequence.get_name())
 
     queue = subsystem.get_queue()
     queue.delete_all_jobs()

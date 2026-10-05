@@ -93,6 +93,12 @@ DEFAULTS = {
     "send_scene_actors": True,
     "max_scene_actors": 60,
     "log_traffic": False,
+    # Where renders go when the render panel's output folder is left empty, each in a subfolder named
+    # after its sequence. Empty keeps Movie Render Queue's default, the project's Saved/MovieRenders.
+    "render_output_directory": "",
+    # Content-path prefix -> folder, checked first: a sequence under that prefix renders straight into
+    # the folder, e.g. {"/Game/VOID_Starship/": "D:/Renders/Starship"}. The longest matching prefix wins.
+    "render_output_by_path": {},
 }
 
 _cache = None
@@ -131,7 +137,9 @@ def load(force=False):
 def save(values):
     """Write the settings back. Returns the file path, or raises IOError."""
     global _cache
-    merged = dict(DEFAULTS)
+    # Start from what is stored, so settings the caller does not mention survive: the Settings dialog
+    # only shows some of them, and saving it must not reset the render folders.
+    merged = dict(load(force=True))
     merged.update({k: v for k, v in values.items() if k in DEFAULTS})
 
     folder = directory()
